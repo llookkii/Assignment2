@@ -1,0 +1,241 @@
+stages:
+  - prebuild
+  - test
+  - build
+  - deploy
+
+variables:
+  FRONTEND_IMAGE_NAME: relevance-scanner-fe
+  BACKEND_IMAGE_NAME: relevance-scanner-be
+  FRONTEND_TEST_IMAGE_NAME: relevance-scanner-test-fe
+  BACKEND_TEST_IMAGE_NAME: relevance-scanner-test-be
+  IMAGE_VERSION: ${CI_COMMIT_SHORT_SHA}
+  IMAGE_TAG: gcr.io/${GCP_PROJECT_ID}
+  PIPELINE_RUNNER_TAG: gcp_ubuntu
+  SERVER_RUNNER_TAG: gcp_ubuntu
+
+.cleanup_directory:
+  script:
+    - echo "Cleaning up the directory..."
+    - rm -f *.env *.key *.pem || true
+    - rm -f __pycache__/ .pytest_cache/ || true
+    - rm -f *.log *.tmp || true
+    - rm -f *.gitlab-ci.yml || true
+    - rm -f .dockerignore || true
+    - echo "Clean up is completed..."
+
+.gcloud_login:
+  script:
+    - echo ${GCLOUD_SERVICE_KEY} | base64 -d > /tmp/gcloud-service-key.json
+    - export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcloud-service-key.json
+    - gcloud auth activate-service-account --key-file=${GOOGLE_APPLICATION_CREDENTIALS}
+    - gcloud config set project ${GCP_PROJECT_ID}
+    - gcloud auth configure-docker
+
+validate-backend-build:
+  stage: prebuild
+  tags:
+    - ${PIPELINE_RUNNER_TAG}
+  before_script:
+    - !reference [.cleanup_directory, script]
+    - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+  script:
+    - echo "Validating backend Docker build..."
+    - docker build -t ${IMAGE_TAG}/${BACKEND_TEST_IMAGE_NAME}:${IMAGE_VERSION} -f Term-Project-Flask-Container/Dockerfile Term-Project-Flask-Container/ || exit 1
+  after_script:
+    - docker rmi ${IMAGE_TAG}/${BACKEND_TEST_IMAGE_NAME}:${IMAGE_VERSION} || true
+
+validate-frontend-build:
+  stage: prebuild
+  tags:
+    - ${PIPELINE_RUNNER_TAG}
+  before_script:
+    - !reference [ .cleanup_directory, script ]
+    - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+  script:
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "dev" ]; then
+        echo "Replacing backendUrl for development...";
+        sed -i "s|backendUrl: '.*'|backendUrl: 'http://backend:8080/api/getPrediction'|" relevance-scanner-fe/src/environments/environment.ts;
+      fi
+    - echo "Validating frontend Docker build..."
+    - docker build -t ${IMAGE_TAG}/${FRONTEND_TEST_IMAGE_NAME}:${IMAGE_VERSION} -f relevance-scanner-fe/Dockerfile relevance-scanner-fe/ || exit 1
+  after_script:
+    - docker rmi ${IMAGE_TAG}/${FRONTEND_TEST_IMAGE_NAME}:${IMAGE_VERSION} || true
+
+test-code-standard-backend:
+  stage: test
+  tags:
+    - ${PIPELINE_RUNNER_TAG}
+  before_script:
+    - !reference [.cleanup_directory, script]
+    - python3 -m venv venv
+    - source venv/bin/activate
+    - pip install --upgrade pip
+    - pip install pylint
+  script:
+    - echo "Running Pylint for backend linting..."
+    - pylint Term-Project-Flask-Container/ || true
+  after_script:
+    - deactivate || echo "Deactivation failed (Perhaps environment wasn't activated)"
+    - rm -rf venv
+
+test-format-backend:
+  stage: test
+  tags:
+    - ${PIPELINE_RUNNER_TAG}
+  before_script:
+    - !reference [.cleanup_directory, script]
+    - python3 -m venv venv
+    - source venv/bin/activate
+    - pip install black
+  script:
+    - echo "Checking code formatting for backend with Black..."
+    - black --check Term-Project-Flask-Container/ || true
+  after_script:
+    - deactivate || echo "Deactivation failed (Perhaps environment wasn't activated)"
+    - rm -rf venv
+
+test-security-backend:
+  stage: test
+  tags:
+      - ${PIPELINE_RUNNER_TAG}
+  before_script:
+    - !reference [.cleanup_directory, script]
+    - python3 -m venv venv
+    - source venv/bin/activate
+    - pip install bandit
+  script:
+    - echo "Running Bandit for security checks on backend..."
+    - bandit -r Term-Project-Flask-Container/ || true
+  after_script:
+    - deactivate || echo "Deactivation failed (Perhaps environment wasn't activated)"
+    - rm -rf venv
+
+test-code-standard-frontend:
+  stage: test
+  tags:
+    - ${PIPELINE_RUNNER_TAG}
+  before_script:
+    - !reference [.cleanup_directory, script]
+    - npm install eslint
+  script:
+    - echo "Running ESLint for frontend linting..."
+    - eslint relevance-scanner-fe/ --max-warnings 0 || true
+
+test-format-frontend:
+  stage: test
+  tags:
+    - ${PIPELINE_RUNNER_TAG}
+  before_script:
+    - !reference [.cleanup_directory, script]
+    - npm install prettier
+  script:
+    - echo "Checking code formatting for frontend with Prettier..."
+    - npx prettier --check "relevance-scanner-fe/**/*.{js,css,html}" || true
+
+test-security-frontend:
+  stage: test
+  tags:
+      - ${PIPELINE_RUNNER_TAG}
+  before_script:
+    - !reference [.cleanup_directory, script]
+    - cd relevance-scanner-fe
+    - npm install
+    - npm install eslint
+  script:
+    - echo "Running npm audit for frontend dependencies..."
+    - npm audit --audit-level=moderate || true
+  after_script:
+    - cd ..
+
+build-frontend:
+  needs:
+    - test-code-standard-frontend
+    - test-security-frontend
+    - test-format-frontend
+    - validate-frontend-build
+  stage: build
+  tags:
+    - ${PIPELINE_RUNNER_TAG}
+  before_script:
+    - !reference [ .cleanup_directory, script ]
+    - !reference [ .gcloud_login, script ]
+  script:
+    - echo "Building Docker image for the frontend..."
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "dev" ]; then
+        echo "Replacing backendUrl for development in build step...";
+        sed -i "s|backendUrl: '.*'|backendUrl: 'http://backend:8080/api/getPrediction'|" relevance-scanner-fe/src/environments/environment.ts;
+      fi
+    - docker build -t ${IMAGE_TAG}/${FRONTEND_IMAGE_NAME}:${IMAGE_VERSION} -f relevance-scanner-fe/Dockerfile relevance-scanner-fe/
+    - docker push ${IMAGE_TAG}/${FRONTEND_IMAGE_NAME}:${IMAGE_VERSION}
+  after_script:
+    - rm -f /tmp/gcloud-service-key.json
+
+build-backend:
+  stage: build
+  needs:
+    - test-code-standard-backend
+    - test-security-backend
+    - test-format-backend
+    - validate-backend-build
+  tags:
+    - ${PIPELINE_RUNNER_TAG}
+  before_script:
+    - !reference [ .cleanup_directory, script ]
+    - !reference [ .gcloud_login, script ]
+  script:
+    - echo "Building Docker image for the backend..."
+    - docker build -t ${IMAGE_TAG}/${BACKEND_IMAGE_NAME}:${IMAGE_VERSION} -f Term-Project-Flask-Container/Dockerfile Term-Project-Flask-Container/
+    - docker push ${IMAGE_TAG}/${BACKEND_IMAGE_NAME}:${IMAGE_VERSION}
+  after_script:
+    - rm -f /tmp/gcloud-service-key.json
+
+deploy-frontend:
+  needs:
+    - build-frontend
+  stage: deploy
+  tags:
+    - ${SERVER_RUNNER_TAG}
+  before_script:
+    - !reference [ .cleanup_directory, script ]
+    - echo ${GCLOUD_SERVICE_KEY} | base64 -d > /tmp/gcloud-service-key.json
+    - export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcloud-service-key.json
+    - gcloud auth activate-service-account --key-file=${GOOGLE_APPLICATION_CREDENTIALS}
+    - gcloud config set project ${GCP_PROJECT_ID}
+    - docker network create fe-be-network || echo "Network 'fe-be-network' already exists, continuing."
+    - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+
+  script:
+    - echo "Pulling frontend Docker image from GCR..."
+    - docker pull ${IMAGE_TAG}/${FRONTEND_IMAGE_NAME}:${IMAGE_VERSION}
+    - echo "Running frontend Docker container locally..."
+    - docker ps -a --filter "name=${FRONTEND_IMAGE_NAME}" --format "{{.ID}}" | xargs -r docker rm -f
+    - docker run -d --rm -p 8080:8080 --name ${FRONTEND_IMAGE_NAME} --network fe-be-network ${IMAGE_TAG}/${FRONTEND_IMAGE_NAME}:${IMAGE_VERSION}
+  after_script:
+    - rm -f /tmp/gcloud-service-key.json
+    - docker images -q ${IMAGE_TAG}/${FRONTEND_IMAGE_NAME}:${IMAGE_VERSION} && docker rmi ${IMAGE_TAG}/${FRONTEND_IMAGE_NAME}:${IMAGE_VERSION} || echo "Image not found"
+
+deploy-backend:
+  needs:
+    - build-backend
+  stage: deploy
+  tags:
+    - ${SERVER_RUNNER_TAG}
+  before_script:
+    - echo ${GCLOUD_SERVICE_KEY} | base64 -d > /tmp/gcloud-service-key.json
+    - export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcloud-service-key.json
+    - gcloud auth activate-service-account --key-file=${GOOGLE_APPLICATION_CREDENTIALS}
+    - gcloud config set project ${GCP_PROJECT_ID}
+    - docker network create fe-be-network || echo "Network 'fe-be-network' already exists, continuing."
+    - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+  script:
+    - echo "Pulling backend Docker image from GCR..."
+    - docker pull ${IMAGE_TAG}/${BACKEND_IMAGE_NAME}:${IMAGE_VERSION}
+    - echo "Running backend Docker container locally..."
+    - docker ps -a --filter "name=${BACKEND_IMAGE_NAME}" --format "{{.ID}}" | xargs -r docker rm -f
+    - docker run --rm -d -p 8081:8080 --name ${BACKEND_IMAGE_NAME} --network fe-be-network ${IMAGE_TAG}/${BACKEND_IMAGE_NAME}:${IMAGE_VERSION}
+  after_script:
+    - rm -f /tmp/gcloud-service-key.json
+    - docker images -q ${IMAGE_TAG}/${BACKEND_IMAGE_NAME}:${IMAGE_VERSION} && docker rmi ${IMAGE_TAG}/${BACKEND_IMAGE_NAME}:${IMAGE_VERSION} || echo "Image not found"

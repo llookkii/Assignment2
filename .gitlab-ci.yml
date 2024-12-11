@@ -1,0 +1,31 @@
+stages:
+  - prebuild
+  - test
+  - build
+  - deploy
+  - finish
+
+
+include:
+  - local: '/workflows/dev.gitlab-ci.yml'
+    rules:
+      - if: $CI_COMMIT_BRANCH == "dev"
+        when: always
+
+  - local: '/workflows/prod.gitlab-ci.yml'
+    rules:
+      - if: $CI_COMMIT_BRANCH == "main"
+        when: always
+
+  - local: '/workflows/prod.gitlab-ci.yml'
+    rules:
+      - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+        when: always
+
+finish-job:
+  stage: finish
+  script:
+    - echo "Pipeline is finished."
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      when: manual
